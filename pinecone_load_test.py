@@ -6,6 +6,7 @@ import time
 import random
 import threading
 import statistics
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pinecone import Pinecone
 
@@ -15,6 +16,7 @@ VECTOR_DIMENSION = 1024
 BATCH_SIZE = 100  # Pinecone recommended batch size
 DEFAULT_WRITE_THREADS = 10
 DEFAULT_READ_THREADS = 20
+DEFAULT_THREADS_PER_NAMESPACE = 4
 
 
 class LoadTestMetrics:
@@ -105,6 +107,181 @@ def query_random(index, metrics: LoadTestMetrics, stop_event: threading.Event):
             metrics.record(0, success=False)
             if not stop_event.is_set():
                 print(f"   Query error: {e}")
+
+
+class MultiNamespaceMetrics:
+    """Thread-safe metrics collector with per-namespace breakdown."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.global_metrics = LoadTestMetrics()
+        self.per_namespace: dict[str, LoadTestMetrics] = defaultdict(LoadTestMetrics)
+
+    def record(self, namespace: str, latency_ms: float, success: bool = True):
+        self.global_metrics.record(latency_ms, success)
+        with self.lock:
+            ns_metrics = self.per_namespace[namespace]
+        ns_metrics.record(latency_ms, success)
+
+    def start(self):
+        self.global_metrics.start()
+
+    def stop(self):
+        self.global_metrics.stop()
+
+    def summary(self) -> dict:
+        return self.global_metrics.summary()
+
+    def per_namespace_summary(self) -> dict[str, dict]:
+        with self.lock:
+            namespaces = dict(self.per_namespace)
+        result = {}
+        for ns, m in namespaces.items():
+            if m.latencies:
+                result[ns] = {
+                    "queries": m.operation_count,
+                    "errors": m.error_count,
+                    "avg_ms": round(statistics.mean(m.latencies), 2),
+                    "p50_ms": round(statistics.median(m.latencies), 2),
+                }
+        return result
+
+
+def query_namespace(
+    index,
+    namespace: str,
+    metrics: MultiNamespaceMetrics,
+    stop_event: threading.Event,
+    top_k: int = 10,
+):
+    """Continuously query a specific namespace until stop_event is set."""
+    while not stop_event.is_set():
+        try:
+            query_vector = generate_random_vector()
+            start = time.time()
+            index.query(vector=query_vector, top_k=top_k, namespace=namespace)
+            latency_ms = (time.time() - start) * 1000
+            metrics.record(namespace, latency_ms, success=True)
+        except Exception as e:
+            metrics.record(namespace, 0, success=False)
+            if not stop_event.is_set():
+                print(f"   Query error [{namespace}]: {e}")
+
+
+def run_aggressive_multi_namespace_read_test(
+    index,
+    duration_seconds: int,
+    threads_per_namespace: int = DEFAULT_THREADS_PER_NAMESPACE,
+    top_k: int = 10,
+):
+    """Run an aggressive read load test that queries ALL namespaces concurrently.
+
+    Discovers all namespaces from the index stats, then launches
+    `threads_per_namespace` worker threads per namespace, all running
+    simultaneously for maximum query pressure.
+    """
+    print(f"\n{'='*60}")
+    print(f"AGGRESSIVE MULTI-NAMESPACE QUERY STORM")
+    print(f"{'='*60}")
+
+    # Discover namespaces
+    print("Discovering namespaces...")
+    stats = index.describe_index_stats()
+    namespaces = list(stats.namespaces.keys()) if stats.namespaces else []
+
+    if not namespaces:
+        print("No namespaces found in index. Nothing to query.")
+        return
+    if "" in namespaces:
+        # The default namespace shows up as empty string
+        pass
+
+    num_ns = len(namespaces)
+    total_threads = num_ns * threads_per_namespace
+    print(f"Namespaces discovered: {num_ns}")
+    print(f"Threads per namespace: {threads_per_namespace}")
+    print(f"Total concurrent threads: {total_threads:,}")
+    print(f"Duration: {duration_seconds}s")
+    print(f"top_k: {top_k}")
+    print(f"Total vectors in index: {stats.total_vector_count:,}")
+
+    metrics = MultiNamespaceMetrics()
+    stop_event = threading.Event()
+
+    print(f"\nLaunching {total_threads:,} query threads across {num_ns} namespaces...")
+    metrics.start()
+
+    with ThreadPoolExecutor(max_workers=total_threads) as executor:
+        futures = []
+        for ns in namespaces:
+            for _ in range(threads_per_namespace):
+                futures.append(
+                    executor.submit(query_namespace, index, ns, metrics, stop_event, top_k)
+                )
+
+        # Progress reporting
+        start = time.time()
+        last_ops = 0
+        while time.time() - start < duration_seconds:
+            elapsed = int(time.time() - start)
+            remaining = duration_seconds - elapsed
+            current_ops = metrics.global_metrics.operation_count
+            current_errors = metrics.global_metrics.error_count
+            delta = current_ops - last_ops
+            last_ops = current_ops
+            print(
+                f"   {remaining:>4}s remaining | "
+                f"{current_ops:>10,} queries | "
+                f"~{delta:,} qps | "
+                f"{current_errors} errors",
+                end="\r",
+            )
+            time.sleep(1)
+
+        stop_event.set()
+        print(f"\n   Stopping {total_threads:,} threads...")
+
+    metrics.stop()
+
+    # --- Aggregate results ---
+    print(f"\n{'='*60}")
+    print(f"AGGREGATE RESULTS")
+    print(f"{'='*60}")
+    summary = metrics.summary()
+    print(f"Total queries:       {summary['operations']:,}")
+    print(f"Errors:              {summary['errors']}")
+    print(f"Total time:          {summary['elapsed_sec']}s")
+    print(f"Throughput:          {summary['ops_per_sec']:,} queries/sec")
+    print(f"Avg latency:         {summary['avg_latency_ms']}ms")
+    print(f"P50 latency:         {summary['p50_latency_ms']}ms")
+    print(f"P95 latency:         {summary['p95_latency_ms']}ms")
+    print(f"P99 latency:         {summary['p99_latency_ms']}ms")
+    print(f"Min latency:         {summary['min_latency_ms']}ms")
+    print(f"Max latency:         {summary['max_latency_ms']}ms")
+
+    # --- Per-namespace breakdown ---
+    ns_summary = metrics.per_namespace_summary()
+    if ns_summary:
+        print(f"\n{'='*60}")
+        print(f"PER-NAMESPACE BREAKDOWN (top 20 by query count)")
+        print(f"{'='*60}")
+        sorted_ns = sorted(ns_summary.items(), key=lambda x: x[1]["queries"], reverse=True)
+        print(f"{'Namespace':<30} {'Queries':>10} {'Errors':>8} {'Avg ms':>10} {'P50 ms':>10}")
+        print("-" * 72)
+        for ns_name, ns_data in sorted_ns[:20]:
+            display_name = ns_name if ns_name else "(default)"
+            print(
+                f"{display_name:<30} {ns_data['queries']:>10,} {ns_data['errors']:>8} "
+                f"{ns_data['avg_ms']:>10.2f} {ns_data['p50_ms']:>10.2f}"
+            )
+        if len(sorted_ns) > 20:
+            print(f"   ... and {len(sorted_ns) - 20} more namespaces")
+
+        # Hottest / coldest
+        fastest = min(sorted_ns, key=lambda x: x[1]["avg_ms"])
+        slowest = max(sorted_ns, key=lambda x: x[1]["avg_ms"])
+        print(f"\nFastest namespace:   {fastest[0] or '(default)'} — avg {fastest[1]['avg_ms']}ms")
+        print(f"Slowest namespace:   {slowest[0] or '(default)'} — avg {slowest[1]['avg_ms']}ms")
 
 
 def run_write_load_test(index, num_vectors: int, num_threads: int = DEFAULT_WRITE_THREADS):
@@ -293,19 +470,20 @@ def main_menu():
     print("1. Full test (write + read + optional delete)")
     print("2. Write only (upsert vectors)")
     print("3. Read only (query existing vectors)")
-    print("4. Delete all vectors")
-    print("5. Show index stats")
-    print("6. Exit")
+    print("4. Aggressive multi-namespace query storm")
+    print("5. Delete all vectors")
+    print("6. Show index stats")
+    print("7. Exit")
     print()
     
     while True:
         try:
-            choice = int(input("Select option [1-6]: "))
-            if 1 <= choice <= 6:
+            choice = int(input("Select option [1-7]: "))
+            if 1 <= choice <= 7:
                 return choice
         except ValueError:
             pass
-        print("Please enter a number 1-6.")
+        print("Please enter a number 1-7.")
 
 
 def main():
@@ -374,14 +552,23 @@ def main():
             read_threads = prompt_int("Number of read threads", DEFAULT_READ_THREADS)
             run_read_load_test(index, read_duration, read_threads)
         
-        elif choice == 4:  # Delete
+        elif choice == 4:  # Aggressive multi-namespace query storm
+            show_index_stats(index)
+            read_duration = prompt_int("Seconds to run storm", 60)
+            threads_per_ns = prompt_int("Threads per namespace", DEFAULT_THREADS_PER_NAMESPACE)
+            top_k = prompt_int("top_k per query", 10)
+            run_aggressive_multi_namespace_read_test(
+                index, read_duration, threads_per_ns, top_k
+            )
+        
+        elif choice == 5:  # Delete
             if prompt_yes_no("Are you sure you want to delete ALL vectors?", default=False):
                 delete_all_vectors(index)
         
-        elif choice == 5:  # Stats
+        elif choice == 6:  # Stats
             show_index_stats(index)
         
-        elif choice == 6:  # Exit
+        elif choice == 7:  # Exit
             print("\nGoodbye!")
             break
 

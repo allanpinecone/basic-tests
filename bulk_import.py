@@ -477,7 +477,28 @@ def main():
         elif choice == "5":
             try:
                 stats = index.describe_index_stats()
-                print(f"\n{stats}")
+                total = getattr(stats, "total_vector_count", None)
+                dim = getattr(stats, "dimension", None)
+                fullness = getattr(stats, "index_fullness", None)
+                namespaces = getattr(stats, "namespaces", {}) or {}
+
+                print(f"\nIndex Stats:")
+                if dim is not None:
+                    print(f"  Dimension:      {dim}")
+                if total is not None:
+                    print(f"  Total vectors:  {total:,}")
+                if fullness is not None:
+                    print(f"  Index fullness: {fullness}")
+
+                if namespaces:
+                    print(f"\n  Namespaces ({len(namespaces)}):")
+                    for ns in sorted(namespaces.keys()):
+                        ns_info = namespaces[ns]
+                        count = ns_info.get("vector_count", 0) if isinstance(ns_info, dict) else getattr(ns_info, "vector_count", 0)
+                        label = ns if ns != "" else "(default)"
+                        print(f"    - {label}: {count:,} vectors")
+                else:
+                    print(f"\n  No namespaces found.")
             except Exception as e:
                 print(f"Error: {e}")
         elif choice == "6":
