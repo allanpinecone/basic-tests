@@ -18,6 +18,15 @@ except ImportError:
 STORAGE_INTEGRATION_ID = None
 
 
+def _get_total_vector_count(index):
+    """Get the total vector count from index stats, or None on failure."""
+    try:
+        stats = index.describe_index_stats()
+        return getattr(stats, "total_vector_count", None)
+    except Exception:
+        return None
+
+
 def monitor_import(index, import_id: str, poll_interval: int = 10, verbose: bool = False):
     """Poll import status until it reaches a terminal state."""
     print(f"\nMonitoring import '{import_id}' (polling every {poll_interval}s)...")
@@ -30,6 +39,9 @@ def monitor_import(index, import_id: str, poll_interval: int = 10, verbose: bool
     last_pct = None
     last_print_time = 0
     last_raw = None
+    baseline_vectors = _get_total_vector_count(index)
+    if baseline_vectors is not None:
+        print(f"Index vector count at start: {baseline_vectors:,}")
 
     try:
         while True:
@@ -39,16 +51,26 @@ def monitor_import(index, import_id: str, poll_interval: int = 10, verbose: bool
                 pct = getattr(status, "percent_complete", None)
                 state = status.status
 
-                # Print when percentage changes or every 30 seconds
                 if pct != last_pct or (elapsed - last_print_time) >= 30:
                     pct_str = f"{pct:.1f}%" if pct is not None else "N/A"
-                    records = getattr(status, "records_imported", "N/A")
-                    print(f"[{elapsed:5d}s]  status: {state:<12}  progress: {pct_str:<8}  records imported: {records}")
+                    records = getattr(status, "records_imported", None) or 0
+
+                    vec_part = ""
+                    if state not in ("Completed", "Failed", "Cancelled"):
+                        current_vectors = _get_total_vector_count(index)
+                        if current_vectors is not None and baseline_vectors is not None:
+                            added = current_vectors - baseline_vectors
+                            vec_part = f"  vectors added: {added:,} ({current_vectors:,} total)"
+
+                    if records:
+                        print(f"[{elapsed:5d}s]  status: {state:<12}  progress: {pct_str:<8}  records imported: {records:,}{vec_part}")
+                    else:
+                        print(f"[{elapsed:5d}s]  status: {state:<12}  progress: {pct_str:<8}{vec_part}")
+
                     last_pct = pct
                     last_print_time = elapsed
 
                     if verbose:
-                        # Dump all fields from the response
                         raw = _extract_all_fields(status)
                         if raw != last_raw:
                             for k, v in raw.items():
@@ -59,6 +81,10 @@ def monitor_import(index, import_id: str, poll_interval: int = 10, verbose: bool
                     print("-" * 60)
                     print(f"\nImport completed successfully in {elapsed}s!")
                     _print_import_details(status)
+                    if baseline_vectors is not None:
+                        final_vectors = _get_total_vector_count(index)
+                        if final_vectors is not None:
+                            print(f"  Vectors added:  {final_vectors - baseline_vectors:,} ({final_vectors:,} total)")
                     return status
 
                 if state in ("Failed", "Cancelled"):
