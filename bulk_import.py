@@ -137,8 +137,8 @@ def _uri_scheme_for_env(env: str) -> str:
     return {
         ENV_BYOC_AWS: "s3://",
         ENV_BYOC_GCP: "gs://",
-        ENV_BYOC_AZURE: "azure://",
-        ENV_SAAS: "s3:// or gs://",
+        ENV_BYOC_AZURE: "https://<account>.blob.core.windows.net/... or gs://",
+        ENV_SAAS: "s3://, gs://, or Azure Blob URL",
     }[env]
 
 
@@ -146,7 +146,7 @@ def _uri_example_for_env(env: str) -> str:
     return {
         ENV_BYOC_AWS: "s3://my-bucket/import-data",
         ENV_BYOC_GCP: "gs://my-bucket/import-data",
-        ENV_BYOC_AZURE: "azure://my-container/import-data",
+        ENV_BYOC_AZURE: "https://myaccount.blob.core.windows.net/mycontainer/import-data",
         ENV_SAAS: "s3://my-bucket/import-data",
     }[env]
 
@@ -474,32 +474,40 @@ def _analyze_parquet_layout(all_objects: list, list_prefix: str, provider: str) 
 # ---------------------------------------------------------------------------
 
 def validate_uri(uri: str, env: str) -> bool:
-    if env == ENV_BYOC_AWS:
+    if uri.startswith("s3://"):
         return validate_s3(uri)
-    if env == ENV_BYOC_GCP:
+    if uri.startswith("gs://"):
         return validate_gcs(uri)
-    if env == ENV_BYOC_AZURE:
+    if ".blob.core.windows.net/" in uri:
         return validate_azure(uri)
-    if env == ENV_SAAS:
-        if uri.startswith("gs://"):
-            return validate_gcs(uri)
-        return validate_s3(uri)
+    print(f"  [skip] Unrecognized URI scheme — skipping validation.")
     return True
 
 
 def _validate_uri_scheme(uri: str, env: str) -> bool:
-    """Quick sanity check that the URI scheme matches the chosen environment."""
-    if env == ENV_BYOC_AWS and not uri.startswith("s3://"):
-        print(f"  [WARN] Expected s3:// URI for BYOC-AWS, got: {uri}")
+    """Check that the URI scheme is compatible with the index's cloud.
+
+    Compatibility per Pinecone docs:
+      AWS index:   s3:// only
+      GCP index:   gs:// or https://<acct>.blob.core.windows.net/...
+      Azure index: gs:// or https://<acct>.blob.core.windows.net/...
+      SaaS:        s3://, gs://, or https://<acct>.blob.core.windows.net/...
+    """
+    is_s3 = uri.startswith("s3://")
+    is_gcs = uri.startswith("gs://")
+    is_azure_blob = ".blob.core.windows.net/" in uri
+
+    if env == ENV_BYOC_AWS and not is_s3:
+        print(f"  [WARN] AWS indexes only support s3:// URIs, got: {uri}")
         return False
-    if env == ENV_BYOC_GCP and not uri.startswith("gs://"):
-        print(f"  [WARN] Expected gs:// URI for BYOC-GCP, got: {uri}")
+    if env == ENV_BYOC_GCP and not (is_gcs or is_azure_blob):
+        print(f"  [WARN] GCP indexes support gs:// or Azure Blob URIs, got: {uri}")
         return False
-    if env == ENV_BYOC_AZURE and not (uri.startswith("azure://") or ".blob.core.windows.net" in uri):
-        print(f"  [WARN] Expected azure:// URI for BYOC-Azure, got: {uri}")
+    if env == ENV_BYOC_AZURE and not (is_gcs or is_azure_blob):
+        print(f"  [WARN] Azure indexes support gs:// or Azure Blob URIs, got: {uri}")
         return False
-    if env == ENV_SAAS and not (uri.startswith("s3://") or uri.startswith("gs://")):
-        print(f"  [WARN] Standard SaaS import expects s3:// or gs:// URI, got: {uri}")
+    if env == ENV_SAAS and not (is_s3 or is_gcs or is_azure_blob):
+        print(f"  [WARN] Expected s3://, gs://, or Azure Blob URI, got: {uri}")
         return False
     return True
 
