@@ -28,6 +28,7 @@ import time
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime
 
 from pinecone import Pinecone, ImportErrorMode
@@ -224,17 +225,37 @@ def pick_index(pc: Pinecone) -> tuple[str | None, str | None]:
     return None, None
 
 
-def test_connection(index) -> bool:
-    """Quick connectivity check via describe_index_stats."""
+CONNECT_TIMEOUT_SEC = 5
+
+
+def test_connection(index, timeout: float = CONNECT_TIMEOUT_SEC) -> bool:
+    """Quick connectivity check via describe_index_stats, with a hard timeout."""
+    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        stats = index.describe_index_stats()
+        future = executor.submit(index.describe_index_stats)
+        try:
+            stats = future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            print(
+                f"  Connection timed out after {timeout:.0f}s — "
+                f"describe_index_stats() did not respond."
+            )
+            print(
+                "  This usually means the index host is unreachable from this "
+                "machine (DNS, firewall, VPN, or private-endpoint routing)."
+            )
+            future.cancel()
+            return False
+        except Exception as e:
+            print(f"  Connection failed: {e}")
+            return False
+
         dim = getattr(stats, "dimension", "?")
         total = getattr(stats, "total_vector_count", 0)
         print(f"  Connected! (dimension={dim}, vectors={total:,})")
         return True
-    except Exception as e:
-        print(f"  Connection failed: {e}")
-        return False
+    finally:
+        executor.shutdown(wait=False)
 
 
 def describe_index_stats(index):
@@ -271,11 +292,50 @@ def describe_index_stats(index):
         print(f"  Error: {e}")
 
 
+PRIVATE_HOST_PROBE_TIMEOUT_SEC = 2
+
+
+def _maybe_privatize_host(host: str) -> str:
+    """Rewrite a BYOC public host to its private-endpoint equivalent.
+
+    The Pinecone API returns hosts like:
+        <idx>.svc.<env>.byoc.pinecone.io
+    Inside the customer VPC the data-plane is reached via the VPC endpoint
+    whose TLS cert covers:
+        *.svc.private.<env>.byoc.pinecone.io
+    We rewrite to the private host only when it is *actually* reachable from
+    this machine — verified with a real TCP connect, not just DNS, since
+    BYOC publishes the private endpoint as a public DNS A record pointing
+    at an RFC1918 address that is only routable from inside the VPC.
+    """
+    m = re.match(
+        r"(https?://)?([^.]+)\.(svc\.)([^.]+\.byoc\.pinecone\.io)(.*)",
+        host,
+    )
+    if not m:
+        return host
+    scheme, idx, svc, tail, rest = m.groups()
+    private_host = f"{idx}.{svc}private.{tail}"
+
+    try:
+        sock = socket.create_connection(
+            (private_host, 443), timeout=PRIVATE_HOST_PROBE_TIMEOUT_SEC
+        )
+        sock.close()
+    except (socket.gaierror, socket.timeout, OSError):
+        return host
+
+    rewritten = f"{scheme or ''}{private_host}{rest}"
+    print(f"  (Using private endpoint: {private_host})")
+    return rewritten
+
+
 def connect_to_index(pc, name=None, host=None):
     """Connect to an index by host or name, test it, return (index, name, host)."""
     if host:
         if not host.startswith("https://"):
             host = f"https://{host}"
+        host = _maybe_privatize_host(host)
         print(f"\n  Connecting to '{name or host}'...")
         index = pc.Index(host=host)
     elif name:
@@ -1545,6 +1605,235 @@ def run_namespace_storm(index, duration_seconds: int, threads_per_namespace: int
         print(f"  Slowest: {slowest[0] or '(default)'} — avg {slowest[1]['avg_ms']}ms")
 
 
+def _timed(fn, *args, **kwargs):
+    """Call fn and return (result, elapsed_ms)."""
+    t0 = time.time()
+    result = fn(*args, **kwargs)
+    return result, (time.time() - t0) * 1000
+
+
+def run_demo_loop(index):
+    """Continuous loop cycling through upsert, query, list, fetch, update every 500ms."""
+    section_header("DEMO MODE — Continuous CRUD")
+    print("  Each cycle: upsert → query → list → fetch → update")
+    print("  Interval: 500ms between cycles")
+    print("  Press Ctrl+C to stop.\n")
+
+    run_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    cycle = 0
+    upserted_ids = []
+    try:
+        while True:
+            cycle += 1
+            vec_id = f"demo-{run_id}-{cycle}"
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+            _, write_ms = _timed(
+                index.upsert,
+                vectors=[{"id": vec_id, "values": _generate_random_vector(), "metadata": {"demo_run": run_id, "cycle": cycle}}],
+            )
+            upserted_ids.append(vec_id)
+
+            _, query_ms = _timed(index.query, vector=_generate_random_vector(), top_k=1)
+
+            _, list_ms = _timed(index.list, prefix=f"demo-{run_id}-", limit=10)
+
+            pick = upserted_ids[random.randint(0, len(upserted_ids) - 1)]
+            _, fetch_ms = _timed(index.fetch, ids=[pick])
+
+            _, update_ms = _timed(
+                index.update,
+                id=pick,
+                set_metadata={"updated_cycle": cycle},
+            )
+
+            print(
+                f"  [{ts}]  upsert {write_ms:5.0f}ms  "
+                f"query {query_ms:5.0f}ms  "
+                f"list {list_ms:5.0f}ms  "
+                f"fetch {fetch_ms:5.0f}ms  "
+                f"update {update_ms:5.0f}ms"
+            )
+
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print(f"\n\n  Demo stopped after {cycle} cycles. {len(upserted_ids)} vectors remain in index.")
+
+
+def run_list_and_fetch_test(index):
+    """Test list and fetch operations against the connected index."""
+    section_header("LIST & FETCH TEST")
+
+    namespace = input("  Namespace (Enter for default): ").strip() or ""
+    ns_display = namespace or "(default)"
+
+    prefix = input("  ID prefix filter (Enter for none): ").strip() or None
+    limit = prompt_int("  Max IDs to list", 20)
+
+    print(f"\n  Listing vectors in namespace '{ns_display}'...")
+    list_kwargs = {"namespace": namespace, "limit": limit}
+    if prefix:
+        list_kwargs["prefix"] = prefix
+        print(f"  Prefix filter: '{prefix}'")
+
+    try:
+        t0 = time.time()
+        results = index.list(**list_kwargs)
+        list_ms = (time.time() - t0) * 1000
+    except Exception as e:
+        print(f"  List failed: {e}")
+        return
+
+    vector_ids = []
+    if hasattr(results, "vectors"):
+        vector_ids = [v.id if hasattr(v, "id") else str(v) for v in results.vectors]
+    elif isinstance(results, dict) and "vectors" in results:
+        vector_ids = [v.get("id", str(v)) if isinstance(v, dict) else str(v) for v in results["vectors"]]
+    else:
+        for item in results:
+            if isinstance(item, str):
+                vector_ids.append(item)
+            elif isinstance(item, list):
+                vector_ids.extend(item)
+            elif hasattr(item, "id"):
+                vector_ids.append(item.id)
+
+    print(f"\n  List returned {len(vector_ids)} ID(s) in {list_ms:.1f}ms")
+    if not vector_ids:
+        print("  No vectors found. Nothing to fetch.")
+        return
+
+    for vid in vector_ids[:20]:
+        print(f"    - {vid}")
+    if len(vector_ids) > 20:
+        print(f"    ... and {len(vector_ids) - 20} more")
+
+    fetch_count = min(len(vector_ids), prompt_int(f"\n  How many to fetch? (max {len(vector_ids)})", min(len(vector_ids), 10)))
+    ids_to_fetch = vector_ids[:fetch_count]
+
+    print(f"\n  Fetching {len(ids_to_fetch)} vector(s)...")
+    try:
+        t0 = time.time()
+        fetch_result = index.fetch(ids=ids_to_fetch, namespace=namespace)
+        fetch_ms = (time.time() - t0) * 1000
+    except Exception as e:
+        print(f"  Fetch failed: {e}")
+        return
+
+    fetched = {}
+    if hasattr(fetch_result, "vectors"):
+        fetched = fetch_result.vectors or {}
+    elif isinstance(fetch_result, dict):
+        fetched = fetch_result.get("vectors", {})
+
+    print(f"  Fetched {len(fetched)} vector(s) in {fetch_ms:.1f}ms\n")
+
+    for vid, vec in list(fetched.items())[:5]:
+        values = None
+        metadata = None
+        if hasattr(vec, "values"):
+            values = vec.values
+            metadata = getattr(vec, "metadata", None)
+        elif isinstance(vec, dict):
+            values = vec.get("values")
+            metadata = vec.get("metadata")
+
+        dim_str = f"{len(values)}d" if values else "?"
+        print(f"    {vid}  ({dim_str})")
+        if metadata:
+            print(f"      metadata: {dict(metadata) if not isinstance(metadata, dict) else metadata}")
+    if len(fetched) > 5:
+        print(f"    ... and {len(fetched) - 5} more")
+
+    print(f"\n  Summary:")
+    print(f"    List:  {len(vector_ids)} IDs in {list_ms:.1f}ms")
+    print(f"    Fetch: {len(fetched)}/{len(ids_to_fetch)} vectors in {fetch_ms:.1f}ms")
+
+
+def run_update_test(index):
+    """Test update operations — upsert vectors then update their metadata and values."""
+    section_header("UPDATE TEST")
+
+    namespace = input("  Namespace (Enter for default): ").strip() or ""
+    ns_display = namespace or "(default)"
+    count = prompt_int("  Number of vectors to create and update", 5)
+
+    run_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    ids = [f"update-test-{run_id}-{i}" for i in range(1, count + 1)]
+
+    print(f"\n  Step 1: Upserting {count} vector(s) into namespace '{ns_display}'...")
+    vectors = [
+        {"id": vid, "values": _generate_random_vector(), "metadata": {"version": 1, "update_test": run_id}}
+        for vid in ids
+    ]
+    try:
+        t0 = time.time()
+        index.upsert(vectors=vectors, namespace=namespace)
+        upsert_ms = (time.time() - t0) * 1000
+        print(f"  Upserted {count} vector(s) in {upsert_ms:.1f}ms")
+    except Exception as e:
+        print(f"  Upsert failed: {e}")
+        return
+
+    print(f"\n  Step 2: Fetching to confirm original state...")
+    try:
+        t0 = time.time()
+        result = index.fetch(ids=ids, namespace=namespace)
+        fetch_ms = (time.time() - t0) * 1000
+        fetched = result.vectors if hasattr(result, "vectors") else result.get("vectors", {})
+        print(f"  Fetched {len(fetched)} vector(s) in {fetch_ms:.1f}ms")
+        for vid in ids[:3]:
+            vec = fetched.get(vid)
+            if vec:
+                meta = getattr(vec, "metadata", None) or (vec.get("metadata") if isinstance(vec, dict) else None)
+                print(f"    {vid}  metadata: {dict(meta) if meta and not isinstance(meta, dict) else meta}")
+        if count > 3:
+            print(f"    ... and {count - 3} more")
+    except Exception as e:
+        print(f"  Fetch failed: {e}")
+
+    print(f"\n  Step 3: Updating vectors (new values + metadata version=2)...")
+    update_times = []
+    for vid in ids:
+        try:
+            t0 = time.time()
+            index.update(
+                id=vid,
+                values=_generate_random_vector(),
+                set_metadata={"version": 2, "updated_at": datetime.now().isoformat()},
+                namespace=namespace,
+            )
+            ms = (time.time() - t0) * 1000
+            update_times.append(ms)
+            print(f"    Updated {vid} in {ms:.1f}ms")
+        except Exception as e:
+            print(f"    Update failed for {vid}: {e}")
+
+    print(f"\n  Step 4: Fetching to verify updates...")
+    try:
+        t0 = time.time()
+        result = index.fetch(ids=ids, namespace=namespace)
+        fetch_ms = (time.time() - t0) * 1000
+        fetched = result.vectors if hasattr(result, "vectors") else result.get("vectors", {})
+        print(f"  Fetched {len(fetched)} vector(s) in {fetch_ms:.1f}ms")
+        for vid in ids[:3]:
+            vec = fetched.get(vid)
+            if vec:
+                meta = getattr(vec, "metadata", None) or (vec.get("metadata") if isinstance(vec, dict) else None)
+                print(f"    {vid}  metadata: {dict(meta) if meta and not isinstance(meta, dict) else meta}")
+        if count > 3:
+            print(f"    ... and {count - 3} more")
+    except Exception as e:
+        print(f"  Fetch failed: {e}")
+
+    print(f"\n  Summary:")
+    print(f"    Upsert:  {count} vectors in {upsert_ms:.1f}ms")
+    if update_times:
+        avg = sum(update_times) / len(update_times)
+        print(f"    Updates: {len(update_times)} in {sum(update_times):.1f}ms total (avg {avg:.1f}ms)")
+    print(f"    Vectors remain in index under namespace '{ns_display}'.")
+
+
 def action_delete_all_vectors(state: dict):
     index = state["index"]
     try:
@@ -1585,8 +1874,11 @@ def menu_load_testing(state: dict):
         print("  2. Write only (upsert vectors)")
         print("  3. Read only (query existing vectors)")
         print("  4. Multi-namespace query storm")
-        print("  5. Delete all test vectors")
-        print("  6. Show index stats")
+        print("  5. List & fetch test")
+        print("  6. Update test")
+        print("  7. Demo mode (continuous read/write every 500ms)")
+        print("  8. Delete all test vectors")
+        print("  9. Show index stats")
         print("  b. Back to main menu")
 
         choice = input("\n  Select option: ").strip().lower()
@@ -1623,8 +1915,14 @@ def menu_load_testing(state: dict):
             top_k = prompt_int("  top_k per query", 10)
             run_namespace_storm(index, duration, threads_per_ns, top_k)
         elif choice == "5":
-            action_delete_all_vectors(state)
+            run_list_and_fetch_test(index)
         elif choice == "6":
+            run_update_test(index)
+        elif choice == "7":
+            run_demo_loop(index)
+        elif choice == "8":
+            action_delete_all_vectors(state)
+        elif choice == "9":
             describe_index_stats(index)
         else:
             print("  Invalid option.")
@@ -2011,9 +2309,10 @@ def main():
         print("  2. Bulk Import")
         print("  3. Load Testing")
         print("  4. Backups")
-        print("  5. Describe Index Stats")
-        print("  6. Inspect Parquet File")
-        print("  7. Switch / Connect Index")
+        print("  5. Demo Mode (continuous read/write)")
+        print("  6. Describe Index Stats")
+        print("  7. Inspect Parquet File")
+        print("  8. Switch / Connect Index")
         print("  q. Quit")
 
         choice = input("\n  Select option: ").strip().lower()
@@ -2031,12 +2330,17 @@ def main():
             menu_backups(state)
         elif choice == "5":
             if state.get("index"):
+                run_demo_loop(state["index"])
+            else:
+                print("  No index connected. Use option 8 to connect first.")
+        elif choice == "6":
+            if state.get("index"):
                 describe_index_stats(state["index"])
             else:
-                print("  No index connected. Use option 7 to connect first.")
-        elif choice == "6":
-            action_inspect_parquet()
+                print("  No index connected. Use option 8 to connect first.")
         elif choice == "7":
+            action_inspect_parquet()
+        elif choice == "8":
             action_switch_index(state)
         else:
             print("  Invalid option.")
