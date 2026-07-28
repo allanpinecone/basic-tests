@@ -73,6 +73,13 @@ The toolkit is organized into sub-menus accessible from a single main menu:
 - **Inspect Parquet File** — validate a local `.parquet` file's schema, dimensions, and structure for Pinecone compatibility
 - **Switch Index** — change your connected index at any time without restarting
 
+## Standalone Scripts & Guides
+
+| File | Purpose |
+|------|---------|
+| `byoc_bulk_import.py` | Self-contained bulk import into a BYOC index, with private-endpoint detection |
+| `BYOC_BULK_IMPORT_TROUBLESHOOTING.md` | Troubleshooting guide for failed BYOC bulk imports — permissions, network routing, data layout, and a diagnostic playbook |
+
 ## Environment Variables
 
 | Variable | Purpose |
